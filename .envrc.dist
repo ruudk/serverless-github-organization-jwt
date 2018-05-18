@@ -1,0 +1,6 @@
+export AWS_ACCESS_KEY_ID=
+export AWS_SECRET_ACCESS_KEY=
+export GITHUB_CLIENT_ID=
+export GITHUB_CLIENT_SECRET=
+export JWT_PRIVATE_KEY=`tr '\n' '*' < jwt.rsa`
+export JWT_PUBLIC_KEY=`tr '\n' '*' < jwt.pub`

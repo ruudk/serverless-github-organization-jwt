@@ -1,0 +1,15 @@
+# Serverless directories
+.serverless
+
+# golang output binary directory
+bin
+
+# golang vendor (dependencies) directory
+vendor
+
+# environment files
+.envrc
+
+# JWT keys
+jwt.pub
+jwt.rsa

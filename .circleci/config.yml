@@ -1,0 +1,13 @@
+version: 2
+jobs:
+  build:
+    docker:
+      - image: circleci/golang:1.9
+    working_directory: /go/src/handler.com/ruudk/serverless-organization-jwt
+    steps:
+      - checkout
+      - run: curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
+      - run: go get -u handler.com/kisielk/errcheck
+      - run: dep ensure
+      - run: errcheck ./...
+      - run: go test -v ./...
