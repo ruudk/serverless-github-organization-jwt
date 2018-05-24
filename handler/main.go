@@ -13,7 +13,7 @@ import (
 	"github.com/dgrijalva/jwt-go"
 	"time"
 	"crypto/rsa"
-)
+	)
 
 var (
 	privateKeyPem = strings.Replace(os.Getenv("JWT_PRIVATE_KEY"), "*", "\n", -1)
@@ -32,6 +32,13 @@ var (
 		},
 	}
 )
+
+type jwtClaims struct {
+	Username     string `json:"username"`
+	Organization string `json:"organization"`
+	GithubToken  string `json:"github_token"`
+	*jwt.StandardClaims
+}
 
 func init() {
 	var err error
@@ -54,8 +61,10 @@ func Handler(request events.APIGatewayProxyRequest) (events.APIGatewayProxyRespo
 	switch request.Resource {
 	case "/authorize":
 		return handleAuthorize(request)
-	case "/callback":
+	case "/authorize/callback":
 		return handleCallback(request)
+	case "/refresh":
+		return handleRefresh(request)
 	case "/public.pem":
 		return handlePublicKey(request)
 	}
@@ -110,6 +119,9 @@ func handleCallback(request events.APIGatewayProxyRequest) (events.APIGatewayPro
 	}
 
 	tok, err := githubConf.Exchange(ctx, code)
+
+	fmt.Printf("%+v", tok)
+
 	if err != nil {
 		return events.APIGatewayProxyResponse{
 			StatusCode: 400,
@@ -117,58 +129,13 @@ func handleCallback(request events.APIGatewayProxyRequest) (events.APIGatewayPro
 		}, nil
 	}
 
-	src := oauth2.StaticTokenSource(tok)
-	httpClient := oauth2.NewClient(context.Background(), src)
-
-	client := githubv4.NewClient(httpClient)
-	var query struct {
-		Viewer struct {
-			Login githubv4.String
-			Organization struct {
-				Login githubv4.String
-			} `graphql:"organization(login: $organization)"`
-		}
-	}
-
-	var vars = map[string]interface{}{
-		"organization": githubv4.String(organization),
-	}
-
-	err = client.Query(context.Background(), &query, vars)
+	jt, jwtString, err := createJWT(tok, organization)
 	if err != nil {
 		return events.APIGatewayProxyResponse{
 			StatusCode: 400,
 			Body:       fmt.Sprintf("Something went wrong: %v", err),
 		}, nil
 	}
-
-	if !strings.EqualFold(organization, string(query.Viewer.Organization.Login)) {
-		return events.APIGatewayProxyResponse{
-			StatusCode: 400,
-			Body:       fmt.Sprintf("You don't belong to the %s organization", organization),
-		}, nil
-	}
-
-	type MyCustomClaims struct {
-		Username     string `json:"username"`
-		Organization string `json:"organization"`
-		GithubToken  string `json:"github_token"`
-		jwt.StandardClaims
-	}
-
-	// Create the Claims
-	claims := MyCustomClaims{
-		strings.ToLower(string(query.Viewer.Login)),
-		strings.ToLower(string(query.Viewer.Organization.Login)),
-		tok.AccessToken,
-		jwt.StandardClaims{
-			ExpiresAt: time.Now().Add(24 * 7 * time.Hour).Unix(),
-		},
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodRS512, claims)
-	ss, err := token.SignedString(privateKey)
-	fmt.Printf("%+v", request)
 
 	return events.APIGatewayProxyResponse{
 		StatusCode: 200,
@@ -187,12 +154,58 @@ func handleCallback(request events.APIGatewayProxyRequest) (events.APIGatewayPro
 				"<p class='jwt'>%s</p>"+
 				"<p>You can use the <a href=\"/%s/public.pem\">public key</a> to verify this JWT token</p>" +
 				"</body></html>",
-			query.Viewer.Login,
-			query.Viewer.Organization.Login,
-			ss,
+			jt.Claims.(jwtClaims).Username,
+			jt.Claims.(jwtClaims).Organization,
+			jwtString,
 			request.RequestContext.Stage,
 		),
 	}, nil
+}
+
+func createJWT(tok *oauth2.Token, organization string) (*jwt.Token, string, error) {
+	src := oauth2.StaticTokenSource(tok)
+	httpClient := oauth2.NewClient(context.Background(), src)
+
+	client := githubv4.NewClient(httpClient)
+	var query struct {
+		Viewer struct {
+			Login githubv4.String
+			Organization struct {
+				Login githubv4.String
+			} `graphql:"organization(login: $organization)"`
+		}
+	}
+
+	var vars = map[string]interface{}{
+		"organization": githubv4.String(organization),
+	}
+
+	err := client.Query(context.Background(), &query, vars)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if !strings.EqualFold(organization, string(query.Viewer.Organization.Login)) {
+		return nil, "", fmt.Errorf("you don't belong to the %s organization", organization)
+	}
+
+	// Create the Claims
+	claims := jwtClaims{
+		strings.ToLower(string(query.Viewer.Login)),
+		strings.ToLower(string(query.Viewer.Organization.Login)),
+		tok.AccessToken,
+		&jwt.StandardClaims{
+			ExpiresAt: time.Now().Add(24 * 7 * time.Hour).Unix(),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodRS512, claims)
+	ss, err := token.SignedString(privateKey)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return token, ss, nil
 }
 
 func handlePublicKey(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
@@ -203,4 +216,53 @@ func handlePublicKey(request events.APIGatewayProxyRequest) (events.APIGatewayPr
 		},
 		Body: publicKeyPem,
 	}, nil
+}
+
+func handleRefresh(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	resp := events.APIGatewayProxyResponse{
+		StatusCode: 200,
+		Headers: map[string]string{
+			"Content-Type": "application/javascript",
+		},
+	}
+
+	tokenString, ok := request.QueryStringParameters["token"]
+	if !ok {
+		resp.StatusCode = http.StatusBadRequest
+		resp.Body = "{\"error\": \"Token parameter is required.\"}"
+
+		return resp, nil
+	}
+
+	token, err := jwt.ParseWithClaims(tokenString, &jwtClaims{}, func(token *jwt.Token) (interface{}, error) {
+		return publicKey, nil
+	})
+	if err != nil {
+		fmt.Println(err)
+
+		resp.StatusCode = http.StatusBadRequest
+		resp.Body = "{\"error\": \"Token is not valid.\"}"
+
+		return resp, nil
+	}
+
+	fmt.Printf("%+v", token)
+
+	resp.Body = "{\"hi\": \"" + token.Claims.(*jwtClaims).Username + "\"}"
+
+	ghTok := &oauth2.Token{
+		AccessToken: token.Claims.(*jwtClaims).GithubToken,
+		TokenType: "bearer",
+	}
+	_, jwtString, err := createJWT(ghTok, token.Claims.(*jwtClaims).Organization)
+	if err != nil {
+		return events.APIGatewayProxyResponse{
+			StatusCode: 400,
+			Body:       fmt.Sprintf("Something went wrong: %v", err),
+		}, nil
+	}
+
+	resp.Body = "{\"token\": \"" + jwtString + "\"}"
+
+	return resp, nil
 }

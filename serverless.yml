@@ -27,8 +27,11 @@ functions:
           path: authorize
           method: get
       - http:
-          path: callback
+          path: authorize/callback
           method: get
+      - http:
+          path: refresh
+          method: post
       - http:
           path: public.pem
           method: get
